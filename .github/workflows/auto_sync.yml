@@ -1,4 +1,4 @@
-name: Tự động tải EPG TVB và Đẩy sang Public Repo
+name: Tự động tải EPG TVB USA
 
 on:
   schedule:
