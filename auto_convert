@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Tai lich phat song TVB Drama (tvbusa.com) va xuat ra file XMLTV chuan.
+
+Cach hoat dong (khac han ban cu):
+- KHONG dung tabula (tabula doc PDF theo dong/text tho, lam vo cau truc bang
+  va tron lan cac cot ngay trong tuan voi nhau).
+- Dung pdfplumber.extract_tables() de lay dung TUNG O (cell) cho tung cot
+  ngay-trong-tuan (vi du "Mon - Fri", "Saturday", "Sunday", "Tue-Sat"...),
+  giu nguyen thu tu cac chuong trinh trong o do.
+- Gio PDT trong file la gio "chuan" (header ghi ro "Date Refers to PDT"),
+  nhung nhan AM/PM in kem tren PDF nhieu khi khong dang tin (co dong ghi
+  "PM" nhung theo mach thoi gian lai la buoi sang). Vi vay script suy ra
+  AM/PM bang quy tac "gio sau phai >= gio truoc" trong cung 1 khoi
+  (monotonic inference) thay vi tin tuyet doi nhan AM/PM in tren PDF.
+- Cac dong co dang ". Ten Phim  9/15" la truong hop 1 khung gio quay vong
+  nhieu bo phim trong thang; con so 9/15 la ngay (theo gio PDT) ma phim do
+  BAT DAU phat (thay the phim truoc no trong danh sach), phim khong co
+  ngay thi duoc coi la mac dinh tu dau thang.
+- Gio phat song duoc doi tu America/Los_Angeles (PDT/PST) sang
+  Asia/Ho_Chi_Minh bang zoneinfo (doi mui gio that su, khong phai kieu
+  "dan +0700 vao dong thoi gian" nhu ban cu).
+
+Output: file .xml chuan XMLTV, co <title lang="zh">, <sub-title lang="en">,
+<category>, va <previously-shown/> cho ban phat lai.
+"""
+
+import os
+import re
+import sys
+import calendar
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import requests
+import pdfplumber
+import xml.etree.ElementTree as ET
+
+LA_TZ = ZoneInfo("America/Los_Angeles")
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+# --------------------------------------------------------------------------
+# 0) Danh sach kenh ho tro. "anchor" la id xuat hien trong URL dang
+#    https://www.tvbusa.com/schedule/#<anchor>. Thu tu list nay PHAI khop
+#    voi thu tu cac tab/PDF tren trang schedule (da kiem tra thuc te ngay
+#    29/08/2026: TVB1, TVBe, TVB Drama, TVB News, TVBJ1, TVBJ2, TVB SF,
+#    TVB Vietnam, TVB Pearl Drama). Neu TVB doi thu tu tab tren web, ham
+#    find_and_download_pdfs() ben duoi se ghep sai kenh -> PDF, nen ham do
+#    co in ra ten file de nguoi dung tu doi chieu.
+#
+#    LUU Y VE DO PHUC TAP: TVB Drama co luoi gio khoi (block) rat deu va
+#    don gian (da test ky). Cac kenh nhu TVB1 / TVBJ1 / TVBJ2 co cau truc
+#    PHUC TAP HON NHIEU: gio phat khong deu (vd 2:15, 3:15, 4:15...), co
+#    dong rieng cho tung thu trong tuan (nhan "星期一/星期二/..." hoac
+#    "MON/TUE/WED..." chen ngay trong 1 o), co ghi chu "(9/9 暫停)"
+#    (tam ngung/pre-empted) va cac su kien truc tiep gio le nhu
+#    "(9:30pm-11:30pm)". Bo parser hien tai SE VAN chay duoc tren cac kenh
+#    nay (khong crash) va cho ket qua dung phan lon, nhung nhung dong dac
+#    biet noi tren (theo-thu-rieng, tam-ngung, su-kien-truc-tiep) chua
+#    duoc xu ly rieng nen co the bi gan sai ngay/gio. Nen kiem tra lai
+#    output truoc khi dung that.
+CHANNEL_LIST = [
+    ("tvb-1", "翡翠一台", "TVB1", "tvb1.tvbusa.com"),
+    ("tvbe", "TVBe", "TVBe", "tvbe.tvbusa.com"),
+    ("tvb-drama", "翡翠劇集台", "TVB Drama", "tvbdrama.tvbusa.com"),
+    ("tvb-news", "TVB News", "TVB News", "tvbnews.tvbusa.com"),
+    ("tvbj-1", "翡翠綜合台 (紐約)", "TVBJ1 (NY)", "tvbj1.tvbusa.com"),
+    ("tvb-jade-la", "翡翠台 (洛杉磯)", "TVBJ2 (LA)", "tvbj2.tvbusa.com"),
+    ("tvb-jade-sf", "TVB SF (Jade) Cable", "TVB SF (Jade) Cable", "tvbjadesf.tvbusa.com"),
+    ("tvbv", "TVB Vietnam", "TVB Vietnam", "tvbv.tvbusa.com"),
+    ("tvb-pearl-drama", "明珠劇集台", "TVB Pearl Drama", "tvbpearl.tvbusa.com"),
+]
+CHANNEL_BY_ANCHOR = {c[0]: c for c in CHANNEL_LIST}
+
+# --------------------------------------------------------------------------
+# 1) Tai PDF ve. Trang schedule liet ke PDF cua TAT CA cac kenh tren CUNG
+#    1 trang (khong phai 1 URL rieng cho tung #anchor), nen phai do 1 lan
+#    roi lay PDF thu N tuong ung voi kenh thu N trong CHANNEL_LIST.
+# --------------------------------------------------------------------------
+
+def find_and_download_pdfs(anchors, out_dir="."):
+    """anchors: list cac id nhu 'tvb-1', 'tvbj-1'. Tra ve list (anchor, path)."""
+    target_url = "https://www.tvbusa.com/schedule/"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    resp = requests.get(target_url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    pdf_links = re.findall(r'https?://[^\s<>"]+?\.pdf', resp.text, re.I)
+    # loai trung nhung giu thu tu xuat hien dau tien
+    seen = set()
+    pdf_links_unique = []
+    for u in pdf_links:
+        if u not in seen:
+            seen.add(u)
+            pdf_links_unique.append(u)
+
+    if len(pdf_links_unique) < len(CHANNEL_LIST):
+        print(f"⚠️  Canh bao: trang web chi co {len(pdf_links_unique)} link PDF, "
+              f"it hon {len(CHANNEL_LIST)} kenh du kien. Thu tu ghep kenh<->PDF "
+              f"co the bi sai, nen kiem tra lai.")
+
+    results = []
+    for anchor in anchors:
+        if anchor not in CHANNEL_BY_ANCHOR:
+            raise ValueError(f"Khong nhan dien duoc kenh '{anchor}'. "
+                              f"Cac kenh ho tro: {', '.join(CHANNEL_BY_ANCHOR)}")
+        idx = list(CHANNEL_BY_ANCHOR).index(anchor)
+        if idx >= len(pdf_links_unique):
+            raise RuntimeError(f"Khong tim thay PDF cho kenh '{anchor}' tren trang web.")
+        pdf_url = pdf_links_unique[idx]
+        print(f"  - {anchor}: {pdf_url}")
+        pdf_resp = requests.get(pdf_url, headers=headers, timeout=60)
+        pdf_resp.raise_for_status()
+        out_path = os.path.join(out_dir, f"temp_{anchor}.pdf")
+        with open(out_path, "wb") as f:
+            f.write(pdf_resp.content)
+        results.append((anchor, out_path))
+    return results
+
+
+# --------------------------------------------------------------------------
+# 2) Nhan dien cac trang lich (moi thang co 1 trang tieng Trung + 1 trang
+#    tieng Anh, cung mot bo du lieu)
+# --------------------------------------------------------------------------
+
+WEEKDAY_LABELS = {
+    # nhan cot -> danh sach thu (Mon=0 ... Sun=6) ma cot do ap dung
+    "Mon - Fri": [0, 1, 2, 3, 4],
+    "Saturday": [5],
+    "Sunday": [6],
+    "Tue-Sat": [1, 2, 3, 4, 5],
+    "Monday": [0],
+    "星期一至五": [0, 1, 2, 3, 4],
+    "星期六": [5],
+    "星期日": [6],
+    "星期二至六": [1, 2, 3, 4, 5],
+    "星期一": [0],
+}
+
+MONTH_EN = {m.lower(): i for i, m in enumerate(
+    ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
+
+
+def classify_pages(pdf):
+    """Tra ve list (page_index, lang, year, month) cho cac trang co bang lich."""
+    pages = []
+    for i, page in enumerate(pdf.pages):
+        text = page.extract_text() or ""
+        m_en = re.search(r'([A-Za-z]{3,4})\.?\s+(\d{4})\s+Program Schedule', text)
+        m_zh = re.search(r'(\d{4})年(\d{1,2})月份節目表', text)
+        if m_en:
+            mon = MONTH_EN.get(m_en.group(1)[:3].lower())
+            if mon:
+                pages.append((i, "en", int(m_en.group(2)), mon))
+        elif m_zh:
+            pages.append((i, "zh", int(m_zh.group(1)), int(m_zh.group(2))))
+    return pages
+
+
+# --------------------------------------------------------------------------
+# 3) Parse 1 trang thanh danh sach "block" (moi block = 1 cot ngay-trong-tuan)
+# --------------------------------------------------------------------------
+
+TIME_LINE_RE = re.compile(
+    r'^(\d{1,2}:\d{2}\s*(?:AM|PM)?)\s+(\d{1,2}:\d{2})\s*(AM|PM)?\s*(.*)$'
+)
+DATE_SUFFIX_RE = re.compile(r'(\d{1,2})/(\d{1,2})\s*$')
+
+
+def parse_column_cell(cell_text):
+    """Tra ve list entry: {pdt_h, pdt_m, category, is_repeat, titles:[(text,(mm,dd)|None)]}"""
+    if not cell_text:
+        return []
+    lines = [l.strip() for l in cell_text.split("\n") if l.strip()]
+    entries = []
+    cur = None
+    for line in lines:
+        if line == "Next Day":
+            continue
+        m = TIME_LINE_RE.match(line)
+        if m:
+            if cur:
+                entries.append(cur)
+            pdt_hh, pdt_mm = m.group(2).split(":")
+            rest = m.group(4).strip()
+            is_repeat = False
+            category = rest
+            if category.startswith("."):
+                # dong dau tien da la 1 title luon (khung gio khong co category rieng)
+                category = ""
+                lines_remainder = [line]  # se xu ly lai title ngay ben duoi
+            if "(重播)" in category or "(Repeat)" in category or "重播" in category:
+                is_repeat = True
+            category = category.replace("(Repeat)", "").strip()
+            category = re.sub(r'\(重播[^)]*\)', '', category).strip()
+            category = category.rstrip(":").rstrip("：").strip()
+            cur = {
+                "pdt_h": int(pdt_hh),
+                "pdt_m": int(pdt_mm),
+                "category": category,
+                "is_repeat": is_repeat,
+                "titles": [],
+            }
+            # neu chinh dong time-line da chua 1 title (bat dau bang "." )
+            trailing = rest
+            if trailing.startswith("."):
+                t = trailing.lstrip(".").strip()
+                dm = DATE_SUFFIX_RE.search(t)
+                date_tuple = None
+                if dm:
+                    date_tuple = (int(dm.group(1)), int(dm.group(2)))
+                    t = DATE_SUFFIX_RE.sub("", t).strip()
+                if t:
+                    cur["titles"].append((t, date_tuple))
+                cur["category"] = ""
+            continue
+        if cur is None:
+            continue
+        # dong phu: title (co the co "." dau dong hoac khong)
+        text = line
+        is_dotted = text.startswith(".") or text.startswith("．")
+        if is_dotted:
+            text = text.lstrip(".．").strip()
+        dm = DATE_SUFFIX_RE.search(text)
+        date_tuple = None
+        if dm:
+            date_tuple = (int(dm.group(1)), int(dm.group(2)))
+            text = DATE_SUFFIX_RE.sub("", text).strip()
+        if "(重播)" in text or "(Repeat)" in text:
+            cur["is_repeat"] = True
+            text = text.replace("(Repeat)", "").strip()
+            text = re.sub(r'\(重播\)', '', text).strip()
+        if text:
+            cur["titles"].append((text, date_tuple))
+    if cur:
+        entries.append(cur)
+    return entries
+
+
+def parse_page_tables(page):
+    """Tra ve list block: {weekdays:[...], entries:[...]} cho 1 trang."""
+    tables = page.extract_tables()
+    if not tables:
+        return []
+    table = tables[0]
+    blocks = []
+    header_row = None
+    for row in table:
+        if not row:
+            continue
+        # header row: 3 o, moi o co dang "EDT PDT <label> Date" hoac "東岸 西岸 <label> 日期"
+        if all(cell for cell in row) and all(
+            re.search(r'(Date|日期)\s*$', (cell or "").split("\n")[0])
+            for cell in row
+        ):
+            header_row = row
+            continue
+        if header_row is not None:
+            # day la data row tuong ung voi header_row vua thay
+            for col_idx, cell in enumerate(row):
+                if col_idx >= len(header_row):
+                    continue
+                head_cell = (header_row[col_idx] or "").split("\n")[0]
+                label = None
+                for lbl in WEEKDAY_LABELS:
+                    if re.search(re.escape(lbl) + r'\s*(Date|日期)?\s*$', head_cell):
+                        label = lbl
+                        break
+                if label is None:
+                    continue
+                entries = parse_column_cell(cell)
+                blocks.append({"weekdays": WEEKDAY_LABELS[label], "entries": entries})
+            header_row = None
+    return blocks
+
+
+# --------------------------------------------------------------------------
+# 4) Suy ra gio thuc (24h) theo quy tac "khong giam dan" trong tung block,
+#    roi gan vao tung ngay cu the trong thang.
+# --------------------------------------------------------------------------
+
+def infer_hour_24(raw_hour, prev_hour24):
+    am_c = 0 if raw_hour == 12 else raw_hour
+    pm_c = 12 if raw_hour == 12 else raw_hour + 12
+    candidates = sorted([c for c in (am_c, pm_c) if c >= prev_hour24])
+    if candidates:
+        return candidates[0]
+    # khong co lua chon hop le (khong nen xay ra) -> chon PM lam fallback
+    return pm_c
+
+
+def dates_in_month(year, month, weekdays):
+    n_days = calendar.monthrange(year, month)[1]
+    out = []
+    for d in range(1, n_days + 1):
+        dt = datetime(year, month, d)
+        if dt.weekday() in weekdays:
+            out.append(dt.date())
+    return out
+
+
+def resolve_title(titles, air_date):
+    """titles: [(text,(mm,dd)|None), ...]; chon title dang phat vao air_date."""
+    if not titles:
+        return None
+    chosen = titles[0][0]
+    for text, date_tuple in titles:
+        if date_tuple is None:
+            continue
+        try:
+            start_d = date_tuple  # (month, day) theo lich PDT, cung nam voi air_date
+            start_date = air_date.replace(month=start_d[0], day=start_d[1])
+        except ValueError:
+            continue
+        if start_date <= air_date:
+            chosen = text
+    return chosen
+
+
+def build_programmes(blocks, year, month):
+    """Tra ve list dict {start_dt(LA tz), category, title, is_repeat}"""
+    programmes = []
+    for block in blocks:
+        for date in dates_in_month(year, month, block["weekdays"]):
+            prev_hour24 = -1
+            for entry in block["entries"]:
+                hour24 = infer_hour_24(entry["pdt_h"], prev_hour24)
+                prev_hour24 = hour24
+                start_dt = datetime(date.year, date.month, date.day,
+                                     hour24 % 24, entry["pdt_m"], tzinfo=LA_TZ)
+                title = resolve_title(entry["titles"], date)
+                if title is None:
+                    title = entry["category"] or "Chương trình"
+                category = entry["category"] or None
+                programmes.append({
+                    "start": start_dt,
+                    "title": title,
+                    "category": category,
+                    "is_repeat": entry["is_repeat"],
+                })
+    return programmes
+
+
+# --------------------------------------------------------------------------
+# 5) Ghep 2 ngon ngu (theo thu tu, vi ca 2 trang cung 1 thang co cung so
+#    khung gio) va xuat XMLTV
+# --------------------------------------------------------------------------
+
+def merge_lang_programmes(zh_progs, en_progs):
+    zh_sorted = sorted(zh_progs, key=lambda p: p["start"])
+    en_sorted = sorted(en_progs, key=lambda p: p["start"])
+    merged = []
+    en_by_time = {}
+    for p in en_sorted:
+        en_by_time.setdefault(p["start"], []).append(p)
+    for p in zh_sorted:
+        en_match = None
+        cands = en_by_time.get(p["start"])
+        if cands:
+            en_match = cands.pop(0)
+        merged.append({
+            "start": p["start"],
+            "title_zh": p["title"],
+            "title_en": en_match["title"] if en_match else None,
+            "category_zh": p["category"],
+            "category_en": en_match["category"] if en_match else None,
+            "is_repeat": p["is_repeat"],
+        })
+    merged.sort(key=lambda p: p["start"])
+    return merged
+
+
+def indent_xml(elem, level=0):
+    i = "\n" + level * "  "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "  "
+        for j, sub in enumerate(elem):
+            indent_xml(sub, level + 1)
+            if not sub.tail or not sub.tail.strip():
+                sub.tail = i + ("  " if j < len(elem) - 1 else "")
+        if not elem[-1].tail or not elem[-1].tail.strip():
+            elem[-1].tail = i
+    if level and (not elem.tail or not elem.tail.strip()):
+        elem.tail = i
+
+
+def write_xmltv(channels_programmes, out_path):
+    """channels_programmes: list (channel_id, name_zh, name_en, programmes)."""
+    tv = ET.Element("tv", {"generator-info-name": "tvb-xmltv"})
+    for channel_id, name_zh, name_en, _ in channels_programmes:
+        ch = ET.SubElement(tv, "channel", id=channel_id)
+        dn1 = ET.SubElement(ch, "display-name", lang="zh")
+        dn1.text = name_zh
+        dn2 = ET.SubElement(ch, "display-name", lang="en")
+        dn2.text = name_en
+
+    for channel_id, _, _, programmes in channels_programmes:
+        for idx, p in enumerate(programmes):
+            start_vn = p["start"].astimezone(VN_TZ)
+            if idx + 1 < len(programmes):
+                stop_vn = programmes[idx + 1]["start"].astimezone(VN_TZ)
+            else:
+                stop_vn = start_vn + timedelta(hours=1)
+            prog = ET.SubElement(tv, "programme", {
+                "start": start_vn.strftime("%Y%m%d%H%M%S %z"),
+                "stop": stop_vn.strftime("%Y%m%d%H%M%S %z"),
+                "channel": channel_id,
+            })
+            t_zh = ET.SubElement(prog, "title", lang="zh")
+            t_zh.text = p["title_zh"]
+            if p["title_en"]:
+                t_en = ET.SubElement(prog, "sub-title", lang="en")
+                t_en.text = p["title_en"]
+            cat = p["category_en"] or p["category_zh"]
+            if cat:
+                c = ET.SubElement(prog, "category", lang="en" if p["category_en"] else "zh")
+                c.text = cat
+            if p["is_repeat"]:
+                ET.SubElement(prog, "previously-shown")
+
+    indent_xml(tv)
+    tree = ET.ElementTree(tv)
+    tree.write(out_path, encoding="utf-8", xml_declaration=True)
+
+
+# --------------------------------------------------------------------------
+# 6) Main
+# --------------------------------------------------------------------------
+
+def parse_pdf_to_programmes(pdf_path):
+    """Doc 1 file PDF (1 kenh, co the nhieu thang) -> list programme dict
+    da ghep 2 ngon ngu, sap xep theo thoi gian."""
+    with pdfplumber.open(pdf_path) as pdf:
+        page_infos = classify_pages(pdf)
+        if not page_infos:
+            raise RuntimeError(f"Khong nhan dien duoc trang lich nao trong {pdf_path}.")
+
+        by_month = {}
+        for idx, lang, year, month in page_infos:
+            by_month.setdefault((year, month), {})[lang] = pdf.pages[idx]
+
+        all_programmes = []
+        for (year, month), langs in sorted(by_month.items()):
+            zh_page = langs.get("zh")
+            en_page = langs.get("en")
+            zh_progs = build_programmes(parse_page_tables(zh_page), year, month) if zh_page else []
+            en_progs = build_programmes(parse_page_tables(en_page), year, month) if en_page else []
+            if zh_progs and en_progs:
+                merged = merge_lang_programmes(zh_progs, en_progs)
+            elif zh_progs:
+                merged = [{"start": p["start"], "title_zh": p["title"], "title_en": None,
+                           "category_zh": p["category"], "category_en": None,
+                           "is_repeat": p["is_repeat"]} for p in zh_progs]
+            else:
+                merged = [{"start": p["start"], "title_zh": p["title"], "title_en": p["title"],
+                           "category_zh": None, "category_en": p["category"],
+                           "is_repeat": p["is_repeat"]} for p in en_progs]
+            all_programmes.extend(merged)
+
+        all_programmes.sort(key=lambda p: p["start"])
+        return all_programmes
+
+
+def process_channels(anchors, out_path="tvbusa_schedule.xml", local_files=None):
+    """anchors: list id kenh (vd ['tvb-drama','tvbj-1']).
+    local_files: dict anchor->duong dan PDF co san (che do test offline);
+    neu None thi tu dong tai tu tvbusa.com."""
+    if local_files:
+        pdf_paths = [(a, local_files[a]) for a in anchors]
+        downloaded = False
+    else:
+        print("Dang quet trang web de tim link PDF cho tung kenh...")
+        pdf_paths = find_and_download_pdfs(anchors)
+        downloaded = True
+
+    channels_programmes = []
+    for anchor, path in pdf_paths:
+        _, name_zh, name_en, channel_id = CHANNEL_BY_ANCHOR[anchor]
+        print(f"Dang xu ly kenh {name_en} ({anchor})...")
+        try:
+            progs = parse_pdf_to_programmes(path)
+        except Exception as e:
+            print(f"  ⚠️  Loi khi xu ly kenh {anchor}: {e}")
+            continue
+        print(f"  -> {len(progs)} chuong trinh")
+        channels_programmes.append((channel_id, name_zh, name_en, progs))
+        if downloaded and os.path.exists(path):
+            os.remove(path)
+
+    if not channels_programmes:
+        raise RuntimeError("Khong xu ly duoc kenh nao.")
+
+    write_xmltv(channels_programmes, out_path)
+    total = sum(len(p) for _, _, _, p in channels_programmes)
+    return out_path, total
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Tai lich TVB USA -> XMLTV")
+    ap.add_argument("--channels", default="tvb-1,tvbe,tvb-drama,tvb-news,tvbj-1,tvb-jade-la,tvb-jade-sf,tvbv,tvb-pearl-drama",
+                     help="Danh sach kenh, cach nhau boi dau phay. Vd: "
+                          "tvb-drama,tvb-1,tvbj-1. Cac kenh ho tro: " +
+                          ", ".join(CHANNEL_BY_ANCHOR))
+    ap.add_argument("--pdf", action="append", default=None,
+                     help="Che do test offline: 'anchor=duong_dan.pdf' "
+                          "(co the lap lai cho nhieu kenh)")
+    ap.add_argument("-o", "--output", default="tvbusa_schedule.xml")
+    args = ap.parse_args()
+
+    anchors = [a.strip() for a in args.channels.split(",") if a.strip()]
+
+    local_files = None
+    if args.pdf:
+        local_files = {}
+        for item in args.pdf:
+            anchor, path = item.split("=", 1)
+            local_files[anchor.strip()] = path.strip()
+
+    out_path, n = process_channels(anchors, args.output, local_files)
+    print(f"🎉 Thanh cong! Da tao {n} chuong trinh cho {len(anchors)} kenh, luu vao {out_path}")
