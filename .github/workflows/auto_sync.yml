@@ -1,0 +1,58 @@
+name: Tự động tải EPG TVB USA
+
+on:
+  schedule:
+    # Chạy tự động lúc 00:00 UTC mỗi ngày (khoảng 7h sáng giờ VN)
+    - cron: '0 0 * * *'
+  workflow_dispatch: 
+    # Cho phép bạn bấm nút "Run workflow" bằng tay để test
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Tải source code của Repo Private xuống máy chủ ảo
+      - name: Checkout Private Repo
+        uses: actions/checkout@v4
+
+      # 2. Cài đặt Python 3.10
+      - name: Cài đặt Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 3. Cài đặt các thư viện cần thiết
+      - name: Cài đặt thư viện (Dependencies)
+        run: pip install requests pdfplumber tzdata
+
+      # 4. Chạy script để tạo file tvbusa_schedule.xml
+      - name: Chạy Script Engine
+        run: |
+          # Giả định bạn đã sửa default --channels lấy full kênh trong script
+          python "auto_convert.py" -o tvbusa_schedule.xml
+
+      # 5. Clone Repo Public (tvbusa) xuống một thư mục con tên là 'public-repo'
+      - name: Checkout Public Repo
+        uses: actions/checkout@v4
+        with:
+          repository: '${{ github.repository_owner }}/tvbusa'
+          token: ${{ secrets.ENGINE_TOKEN }}
+          path: 'public-repo'
+
+      # 6. Copy file EPG sang thư mục Public và Push lên GitHub
+      - name: Copy & Push EPG sang Public Repo
+        run: |
+          cp tvbusa_schedule.xml public-repo/
+          cd public-repo
+          
+          # Cấu hình user git bot
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add tvbusa_schedule.xml
+          # Bỏ qua lỗi nếu file không có gì thay đổi so với hôm qua
+          git commit -m "Cập nhật EPG TVB: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "Không có thay đổi mới."
+          
+          # Push sang Public Repo
+          git push origin main
