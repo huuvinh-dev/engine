@@ -1,4 +1,4 @@
-name: Tự động tải EPG TVB USA
+name: Tự động tải EPG TVB và Đẩy sang Public Repo
 
 on:
   schedule:
@@ -30,7 +30,7 @@ jobs:
       - name: Chạy Script Engine
         run: |
           # Giả định bạn đã sửa default --channels lấy full kênh trong script
-          python "auto_convert.py" -o tvbusa_schedule.xml
+          python "auto_convert" -o tvbusa_schedule.xml
 
       # 5. Clone Repo Public (tvbusa) xuống một thư mục con tên là 'public-repo'
       - name: Checkout Public Repo
