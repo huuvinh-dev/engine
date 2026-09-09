@@ -81,42 +81,59 @@ CHANNEL_BY_ANCHOR = {c[0]: c for c in CHANNEL_LIST}
 
 def find_and_download_pdfs(anchors, out_dir="."):
     """anchors: list cac id nhu 'tvb-1', 'tvbj-1'. Tra ve list (anchor, path)."""
+    from bs4 import BeautifulSoup
+    
     target_url = "https://www.tvbusa.com/schedule/"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
+    print("Đang tải cấu trúc trang web...")
     resp = requests.get(target_url, headers=headers, timeout=30)
     resp.raise_for_status()
-    pdf_links = re.findall(r'https?://[^\s<>"]+?\.pdf', resp.text, re.I)
-    # loai trung nhung giu thu tu xuat hien dau tien
-    seen = set()
-    pdf_links_unique = []
-    for u in pdf_links:
-        if u not in seen:
-            seen.add(u)
-            pdf_links_unique.append(u)
-
-    if len(pdf_links_unique) < len(CHANNEL_LIST):
-        print(f"⚠️  Canh bao: trang web chi co {len(pdf_links_unique)} link PDF, "
-              f"it hon {len(CHANNEL_LIST)} kenh du kien. Thu tu ghep kenh<->PDF "
-              f"co the bi sai, nen kiem tra lai.")
-
+    
+    soup = BeautifulSoup(resp.text, 'html.parser')
     results = []
+    
     for anchor in anchors:
         if anchor not in CHANNEL_BY_ANCHOR:
-            raise ValueError(f"Khong nhan dien duoc kenh '{anchor}'. "
-                              f"Cac kenh ho tro: {', '.join(CHANNEL_BY_ANCHOR)}")
-        idx = list(CHANNEL_BY_ANCHOR).index(anchor)
-        if idx >= len(pdf_links_unique):
-            raise RuntimeError(f"Khong tim thay PDF cho kenh '{anchor}' tren trang web.")
-        pdf_url = pdf_links_unique[idx]
+            print(f"⚠️ Bỏ qua kênh không nhận diện được: {anchor}")
+            continue
+            
+        # Tìm khu vực (div/section) chứa nội dung của kênh dựa vào ID
+        section = soup.find(id=anchor)
+        pdf_url = None
+        
+        if section:
+            # Tìm thẻ <a> có chứa link .pdf bên trong khu vực này
+            link_tag = section.find('a', href=lambda h: h and '.pdf' in h.lower())
+            if link_tag:
+                pdf_url = link_tag['href']
+        
+        # Fallback: Nếu không tìm thấy qua ID, thử quét regex toàn bộ trang web như cũ
+        # (Chỉ dùng làm phương án dự phòng nếu web lại đổi cấu trúc)
+        if not pdf_url:
+            print(f"⚠️ Không tìm thấy cấu trúc ID '{anchor}', thử quét tự do...")
+            all_pdfs = re.findall(r'https?://[^\s<>"]+?\.pdf', resp.text, re.I)
+            idx = list(CHANNEL_BY_ANCHOR).index(anchor)
+            if idx < len(all_pdfs):
+                pdf_url = all_pdfs[idx]
+        
+        if not pdf_url:
+            print(f"❌ Lỗi: Không thể tìm thấy link PDF cho kênh '{anchor}'.")
+            continue
+            
         print(f"  - {anchor}: {pdf_url}")
+        
+        # Tải file PDF
         pdf_resp = requests.get(pdf_url, headers=headers, timeout=60)
         pdf_resp.raise_for_status()
+        
         out_path = os.path.join(out_dir, f"temp_{anchor}.pdf")
         with open(out_path, "wb") as f:
             f.write(pdf_resp.content)
+            
         results.append((anchor, out_path))
+        
     return results
-
 
 # --------------------------------------------------------------------------
 # 2) Nhan dien cac trang lich (moi thang co 1 trang tieng Trung + 1 trang
