@@ -24,7 +24,7 @@ jobs:
 
       # 3. Cài đặt các thư viện cần thiết
       - name: Cài đặt thư viện (Dependencies)
-        run: pip install requests pdfplumber tzdata
+        run: pip install requests pdfplumber tzdata beautifulsoup4
 
       # 4. Chạy script để tạo file tvbusa_schedule.xml
       - name: Chạy Script Engine
